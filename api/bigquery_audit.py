@@ -225,7 +225,16 @@ class Table:
             raise BigQueryError(f"BigQuery refused the append: {message}")
 
     def keep_alive(self, now: datetime) -> datetime | None:
-        """Move a sandbox expiry forward; return when the table now expires."""
+        """Move a sandbox expiry forward; return when the table now expires.
+
+        The sandbox counts its 60 days from the table's creation, not from
+        now: a table made on 29 September can be kept until late November and
+        no later, however often this runs. It once asked for 59 days from now,
+        which the sandbox refuses once a table is over a day old, and that
+        refusal stopped the audit log opening at all. So: ask for 59 days from
+        now (with billing that simply works); refused by the sandbox, ask for
+        59 days from creation instead, unless the table already expires then.
+        """
         info = self.get()
         if info is None:
             raise BigQueryError("the audit table no longer exists; it may have expired")
@@ -233,12 +242,26 @@ class Table:
         if expires is None:
             return None                     # no expiry: billing is enabled
         when = datetime.fromtimestamp(int(expires) / 1000, UTC)
-        if when - now < EXPIRY_REFRESH_BELOW:
-            when = now + EXPIRY_AHEAD
-            self._call("moving the table's expiry", "PATCH", f"{self._base}/{self.table}",
-                       json={"expirationTime": str(int(when.timestamp() * 1000))})
-            LOG.info("audit table expiry moved to %s", when.isoformat(timespec="minutes"))
-        return when
+        if when - now >= EXPIRY_REFRESH_BELOW:
+            return when
+        wanted = now + EXPIRY_AHEAD
+        try:
+            self._move_expiry(wanted)
+            return wanted
+        except BigQueryError as exc:
+            created = info.get("creationTime")
+            if "sandbox" not in str(exc) or created is None:
+                raise
+        latest = datetime.fromtimestamp(int(created) / 1000, UTC) + EXPIRY_AHEAD
+        if latest <= when:
+            return when                     # already as late as the sandbox allows
+        self._move_expiry(latest)
+        return latest
+
+    def _move_expiry(self, when: datetime) -> None:
+        self._call("moving the table's expiry", "PATCH", f"{self._base}/{self.table}",
+                   json={"expirationTime": str(int(when.timestamp() * 1000))})
+        LOG.info("audit table expiry moved to %s", when.isoformat(timespec="minutes"))
 
 
 def _event(row: dict[str, Any]) -> dict[str, Any]:
@@ -268,7 +291,13 @@ class BigQueryAuditLog:
                          "dispatch attempt, append-only")
         for event in sorted((_event(r) for r in table.rows()), key=lambda e: e["id"]):
             self._remember(event)
-        self._keep_alive()
+        try:
+            self._keep_alive()
+        except BigQueryError as exc:
+            # The trail is readable and writable; only its expiry did not
+            # move. That must never stop approvals, so it is logged and tried
+            # again on the next write.
+            LOG.error("audit table expiry not moved: %s", exc)
 
     def _remember(self, event: dict[str, Any]) -> None:
         self._events.append(event)

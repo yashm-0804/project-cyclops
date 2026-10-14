@@ -68,9 +68,11 @@ class FakeBigQuery:
             key = (m[1], m[2])
             if method == "POST":
                 key = (m[1], body["tableReference"]["tableId"])
-                expires = datetime.now(UTC) + timedelta(days=60) if self.sandbox else None
+                created = datetime.now(UTC)
+                expires = created + timedelta(days=60) if self.sandbox else None
                 self.tables[key] = {"rows": [], "meta": {
                     "location": "asia-south1", "schema": body["schema"],
+                    "creationTime": str(int(created.timestamp() * 1000)),
                     "expirationTime": str(int(expires.timestamp() * 1000)) if expires else None}}
                 return FakeResponse(200, self._meta(key))
             if key not in self.tables:
@@ -87,9 +89,11 @@ class FakeBigQuery:
             if method == "GET":
                 return FakeResponse(200, self._meta(key))
             if method == "PATCH":
+                # The real sandbox counts its 60 days from the table's
+                # creation, not from now (seen live, 14 Oct 2026).
                 wanted = body["expirationTime"]
-                if self.sandbox and (wanted is None or int(wanted) / 1000 - datetime.now(UTC).timestamp()
-                                     >= 60 * 86400):
+                created = int(self.tables[key]["meta"]["creationTime"]) / 1000
+                if self.sandbox and (wanted is None or int(wanted) / 1000 - created >= 60 * 86400):
                     return FakeResponse(403, {"error": {"status": "PERMISSION_DENIED", "message":
                         "Table expiration time must be less than 60 days while in sandbox mode."}})
                 self.tables[key]["meta"]["expirationTime"] = wanted
@@ -270,6 +274,46 @@ def test_the_sandbox_expiry_is_moved_forward_and_billing_leaves_none(backend):
     assert moved.expires == now + bq.EXPIRY_AHEAD, "within the sandbox's 60 days"
     billed = FakeBigQuery(sandbox=False)
     assert bigquery_log(billed).expires is None
+
+
+def _age(backend, days, expires_in):
+    """Make the audit table `days` old, expiring `expires_in` from now."""
+    now = datetime.now(UTC)
+    meta = backend.tables[("bob_forecaster", "audit_events")]["meta"]
+    meta["creationTime"] = str(int((now - timedelta(days=days)).timestamp() * 1000))
+    meta["expirationTime"] = str(int((now + expires_in).timestamp() * 1000))
+    return now, now - timedelta(days=days)
+
+
+def test_an_old_sandbox_table_still_opens_and_records(backend):
+    """Regression: 15 days after creation the log asked for 59 days from now,
+    the sandbox refused, and approvals stopped working altogether."""
+    bigquery_log(backend)
+    now, created = _age(backend, days=15, expires_in=timedelta(days=45))
+    log = bq.BigQueryAuditLog(bq.Table(TABLE, backend), clock=lambda: now)
+    assert log.expires is not None
+    assert abs(log.expires - (created + timedelta(days=60))) < timedelta(seconds=1), \
+        "already as late as the sandbox allows, so left alone"
+    log.record("A-1", "approve", "K. Ramesh")
+    standing = log.current("A-1")
+    assert standing is not None and standing["operator"] == "K. Ramesh"
+
+
+def test_an_old_sandbox_table_is_kept_as_long_as_the_sandbox_allows(backend):
+    bigquery_log(backend)
+    now, created = _age(backend, days=15, expires_in=timedelta(days=5))
+    log = bq.BigQueryAuditLog(bq.Table(TABLE, backend), clock=lambda: now)
+    assert log.expires is not None
+    assert abs(log.expires - (created + bq.EXPIRY_AHEAD)) < timedelta(seconds=1)
+
+
+def test_a_refused_expiry_never_stops_approvals(backend):
+    bigquery_log(backend)
+    now, _ = _age(backend, days=15, expires_in=timedelta(days=5))
+    backend.tables[("bob_forecaster", "audit_events")]["meta"].pop("creationTime")
+    log = bq.BigQueryAuditLog(bq.Table(TABLE, backend), clock=lambda: now)
+    log.record("A-2", "approve", "K. Ramesh")
+    assert log.current("A-2") is not None, "recorded, though the expiry could not move"
 
 
 def test_a_table_that_has_gone_is_reported_not_recreated_silently(backend):
