@@ -2,7 +2,7 @@
 
 **Bay of Bengal Cyclone Impact & Infrastructure Vulnerability Forecaster**
 
-**Build with AI: Code for Communities (2nd edition) · Track 5 · Team SPECODERS**
+**Team SPECODERS**
 
 Two days before a cyclone makes landfall, this system says **which named
 substation, road, hospital and shelter is likely to fail**, how likely, and
@@ -914,5 +914,4 @@ from `web/vendor` keep their own licences: MapLibre GL JS under BSD-3-Clause
 and the Firebase JS SDK under Apache-2.0. The data keeps the terms in the
 table above.
 
-Built by **Team SPECODERS** for Build with AI: Code for Communities
-(2nd edition), Track 5.
+Built by **Team SPECODERS**.
